@@ -1,11 +1,13 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Headers,
   HttpException,
   Param,
   Post,
+  Query,
   Res,
 } from '@nestjs/common';
 import {
@@ -18,6 +20,7 @@ import {
   ApiOkResponse,
   ApiOperation,
   ApiParam,
+  ApiQuery,
   ApiSecurity,
   ApiTags,
   ApiTooManyRequestsResponse,
@@ -30,6 +33,7 @@ import { API_KEY_SECURITY } from '../config/swagger.config';
 import { BookingsService } from './bookings.service';
 import { BookingDto } from './dto/booking.dto';
 import { CreateBookingDto } from './dto/create-booking.dto';
+import { BookingsListResponseDto } from './dto/list-bookings.dto';
 
 @ApiTags('Bookings')
 @ApiSecurity(API_KEY_SECURITY)
@@ -87,6 +91,41 @@ export class BookingsController {
     return outcome.body as BookingDto;
   }
 
+  @Get()
+  @ApiOperation({
+    summary: 'List bookings for an email with cursor pagination',
+  })
+  @ApiQuery({
+    name: 'email',
+    required: true,
+    type: String,
+    description: 'Customer email address',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    description: 'Maximum rows per page (1-50, default 10)',
+  })
+  @ApiQuery({
+    name: 'cursor',
+    required: false,
+    type: String,
+    description: 'Opaque cursor returned by the previous page',
+  })
+  @ApiOkResponse({ type: BookingsListResponseDto })
+  @ApiBadRequestResponse({
+    description: 'Missing email or invalid limit/cursor',
+    type: ErrorResponseDto,
+  })
+  list(
+    @Query('email') email: string | string[] | undefined,
+    @Query('limit') limit: string | string[] | undefined,
+    @Query('cursor') cursor: string | string[] | undefined,
+  ): Promise<BookingsListResponseDto> {
+    return this.bookingsService.list(email, limit, cursor);
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get a single booking by ID' })
   @ApiParam({ name: 'id', description: 'Booking identifier' })
@@ -97,5 +136,21 @@ export class BookingsController {
   })
   findOne(@Param('id') id: string): Promise<BookingDto> {
     return this.bookingsService.findOne(id);
+  }
+
+  @Delete(':id')
+  @ApiOperation({ summary: 'Cancel a confirmed booking' })
+  @ApiParam({ name: 'id', description: 'Booking identifier' })
+  @ApiOkResponse({ type: BookingDto, description: 'Booking cancelled' })
+  @ApiNotFoundResponse({
+    description: 'Booking not found',
+    type: ErrorResponseDto,
+  })
+  @ApiConflictResponse({
+    description: 'Booking is already cancelled',
+    type: ErrorResponseDto,
+  })
+  cancel(@Param('id') id: string): Promise<BookingDto> {
+    return this.bookingsService.cancel(id);
   }
 }

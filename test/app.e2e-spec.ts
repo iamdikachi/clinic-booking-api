@@ -31,15 +31,19 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
     apiKey = app.get(ConfigService<EnvConfig, true>).get('API_KEY', {
       infer: true,
     });
-  });
+  }, 30_000);
 
   afterAll(async () => {
-    await db.query('DELETE FROM bookings');
-    await db.query('DELETE FROM slots');
-    await db.query('DELETE FROM idempotency_keys');
-    await db.query('DELETE FROM attempts');
-    await app.close();
-  });
+    if (db) {
+      await db.query('DELETE FROM bookings');
+      await db.query('DELETE FROM slots');
+      await db.query('DELETE FROM idempotency_keys');
+      await db.query('DELETE FROM attempts');
+    }
+    if (app) {
+      await app.close();
+    }
+  }, 15_000);
 
   it('connects to Postgres via pg pool', async () => {
     await expect(db.ping()).resolves.toBe(true);
@@ -182,10 +186,13 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
     });
     expect(jsonRes.body.components.schemas.ErrorResponseDto).toBeDefined();
     expect(jsonRes.body.components.schemas.CreateBookingDto).toBeDefined();
+    expect(jsonRes.body.components.schemas.BookingsListResponseDto).toBeDefined();
     expect(jsonRes.body.paths['/reset']).toBeDefined();
     expect(jsonRes.body.paths['/slots']).toBeDefined();
     expect(jsonRes.body.paths['/bookings'].post).toBeDefined();
-    expect(jsonRes.body.paths['/bookings/{id}']).toBeDefined();
+    expect(jsonRes.body.paths['/bookings'].get).toBeDefined();
+    expect(jsonRes.body.paths['/bookings/{id}'].get).toBeDefined();
+    expect(jsonRes.body.paths['/bookings/{id}'].delete).toBeDefined();
   });
 
   it('POST /reset clears all tables and keeps past slots, and GET /slots orders and filters properly', async () => {
@@ -372,6 +379,33 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
       .expect(400)
       .expect({ error: 'email must be a valid email address' });
 
+    // Non-string types must return 400 cleanly (never 500)
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 'slot-past', name: 'Alice', email: 789 })
+      .expect(400)
+      .expect({ error: 'email must be a string' });
+
+    const invalidEmailAttempts = await db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM attempts WHERE email IN ('bad-email', '789')`,
+    );
+    expect(Number(invalidEmailAttempts.rows[0].count)).toBe(0);
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 123, name: 'Alice', email: 'types@example.com' })
+      .expect(400)
+      .expect({ error: 'slot_id must be a string' });
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 'slot-past', name: 456, email: 'types@example.com' })
+      .expect(400)
+      .expect({ error: 'name must be a string' });
+
     await request(app.getHttpServer())
       .post('/bookings')
       .set('X-API-Key', apiKey)
@@ -384,8 +418,8 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
       .set('X-API-Key', apiKey)
       .send({ slot_id: 'slot-past', name: 'Alice', email: 'b@example.com' })
       .expect(400)
-      .expect({ error: 'slot is in the past' });
-  }, 15_000);
+      .expect({ error: 'slot has already started' });
+  }, 20_000);
 
   it('POST /bookings allows exactly 1 winner out of 20 parallel requests (1x 201, 19x 409)', async () => {
     await request(app.getHttpServer())
@@ -426,7 +460,7 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
     }
   }, 20_000);
 
-  it('POST /bookings supports Idempotency-Key replay (including 4xx and parallel retries) and 422 on body mismatch', async () => {
+  it('POST /bookings supports Idempotency-Key replay (201/400/404/409), trimmed/lowercased body match, and 422 on mismatch', async () => {
     await request(app.getHttpServer())
       .post('/reset')
       .set('X-API-Key', apiKey)
@@ -457,9 +491,9 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
         .set('X-API-Key', apiKey)
         .set('Idempotency-Key', 'key-success')
         .send({
-          email: 'alice-idem@example.com',
-          name: 'Alice',
-          slot_id: 'idem-slot',
+          email: '  ALICE-IDEM@example.com ',
+          name: '  alice ',
+          slot_id: ' idem-slot ',
         }),
     ]);
 
@@ -480,7 +514,57 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
       .expect(422)
       .expect({ error: 'idempotency key reused with different request body' });
 
-    // Replays 409 identically even if slot were checked again
+    // Caches 400 validation errors too
+    const bad1 = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'key-400')
+      .send({
+        slot_id: '',
+        name: 'Bob',
+        email: 'bob-idem@example.com',
+      })
+      .expect(400);
+
+    const bad2 = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'key-400')
+      .send({
+        email: 'BOB-IDEM@example.com',
+        name: 'bob',
+        slot_id: '   ',
+      })
+      .expect(400);
+
+    expect(bad2.body).toEqual(bad1.body);
+
+    // Caches 404 slot-not-found responses
+    const missing1 = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'key-404')
+      .send({
+        slot_id: 'missing-slot',
+        name: 'Bob',
+        email: 'bob-idem@example.com',
+      })
+      .expect(404);
+
+    const missing2 = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'key-404')
+      .send({
+        slot_id: 'missing-slot',
+        name: 'Bob',
+        email: 'bob-idem@example.com',
+      })
+      .expect(404);
+
+    expect(missing2.body).toEqual(missing1.body);
+
+    // Replays 409 identically
     const err1 = await request(app.getHttpServer())
       .post('/bookings')
       .set('X-API-Key', apiKey)
@@ -504,9 +588,9 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
       .expect(409);
 
     expect(err2.body).toEqual(err1.body);
-  }, 15_000);
+  }, 25_000);
 
-  it('POST /bookings enforces per-email rate limit (5/60s), counts failures & retries, sets Retry-After, and isolates other emails', async () => {
+  it('POST /bookings rate limits at 5 attempts/60s without recording 429s, replays cached idempotent responses while blocked, and isolates emails', async () => {
     await request(app.getHttpServer())
       .post('/reset')
       .set('X-API-Key', apiKey)
@@ -522,28 +606,52 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
       })
       .expect(200);
 
-    // 5 parallel attempts for same email (1x 201 + 4x 409, none 429)
-    const burst = await Promise.all(
-      Array.from({ length: 5 }, () =>
-        request(app.getHttpServer())
-          .post('/bookings')
-          .set('X-API-Key', apiKey)
-          .set('Idempotency-Key', 'rl-same-key')
-          .send({
-            slot_id: 'rl-slot',
-            name: 'Same User',
-            email: '  RATE@Example.COM ',
-          }),
-      ),
-    );
+    // Attempt 1 (201) with Idempotency-Key
+    const first = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'rl-initial-201')
+      .send({
+        slot_id: 'rl-slot',
+        name: 'Same User',
+        email: '  RATE@Example.COM ',
+      })
+      .expect(201);
 
-    expect(burst.every((r) => r.status === 201)).toBe(true);
+    // Attempts 2..5 (failures: 400, 404, 409, 409) all count toward the 5
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: '', name: 'Same User', email: 'rate@example.com' })
+      .expect(400);
 
-    // 6th attempt (even a replay with same Idempotency-Key) hits 429 with Retry-After >= 1
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({
+        slot_id: 'does-not-exist',
+        name: 'Same User',
+        email: 'rate@example.com',
+      })
+      .expect(404);
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 'rl-slot', name: 'Same User', email: 'rate@example.com' })
+      .expect(409);
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 'rl-slot', name: 'Same User', email: 'rate@example.com' })
+      .expect(409);
+
+    // 6th and 7th requests hit 429 with Retry-After >= 1 and NEVER cache 429 or record more attempts
     const sixth = await request(app.getHttpServer())
       .post('/bookings')
       .set('X-API-Key', apiKey)
-      .set('Idempotency-Key', 'rl-same-key')
+      .set('Idempotency-Key', 'rl-never-cache-429')
       .send({
         slot_id: 'rl-slot',
         name: 'Same User',
@@ -557,6 +665,40 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
     expect(retryAfter).toBeGreaterThanOrEqual(1);
     expect(retryAfter).toBeLessThanOrEqual(60);
 
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'rl-never-cache-429')
+      .send({
+        slot_id: 'rl-slot',
+        name: 'Same User',
+        email: 'rate@example.com',
+      })
+      .expect(429);
+
+    const attemptRows = await db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM attempts WHERE email = 'rate@example.com'`,
+    );
+    expect(Number(attemptRows.rows[0].count)).toBe(5);
+
+    const cached429 = await db.query(
+      `SELECT key FROM idempotency_keys WHERE key = 'rl-never-cache-429'`,
+    );
+    expect(cached429.rows).toHaveLength(0);
+
+    // Replaying an earlier cached idempotent request still returns 201 even while email is rate-limited
+    const replayWhileBlocked = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'rl-initial-201')
+      .send({
+        email: 'rate@example.com',
+        name: 'same user',
+        slot_id: 'RL-SLOT',
+      })
+      .expect(201);
+    expect(replayWhileBlocked.body).toEqual(first.body);
+
     // Different email is unaffected (gets 409 for already booked slot, not 429)
     await request(app.getHttpServer())
       .post('/bookings')
@@ -567,7 +709,157 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
         email: 'other@example.com',
       })
       .expect(409);
+  }, 25_000);
+
+  it('DELETE /bookings/:id cancels, frees the slot for rebooking, and returns 409/404 appropriately', async () => {
+    await request(app.getHttpServer())
+      .post('/reset')
+      .set('X-API-Key', apiKey)
+      .send({
+        slots: [
+          {
+            id: 'cancel-slot',
+            provider: 'dr-smith',
+            start: futureStart,
+            end: futureEnd,
+          },
+        ],
+      })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .delete('/bookings/non-existent')
+      .set('X-API-Key', apiKey)
+      .expect(404)
+      .expect({ error: 'booking not found' });
+
+    const created = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({
+        slot_id: 'cancel-slot',
+        name: 'Alice',
+        email: 'alice-cancel@example.com',
+      })
+      .expect(201);
+
+    const cancelled = await request(app.getHttpServer())
+      .delete(`/bookings/${created.body.id}`)
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(cancelled.body).toEqual({
+      ...created.body,
+      status: 'cancelled',
+    });
+    expect(cancelled.body.seq).toBeUndefined();
+
+    // Cancelling again returns 409
+    await request(app.getHttpServer())
+      .delete(`/bookings/${created.body.id}`)
+      .set('X-API-Key', apiKey)
+      .expect(409)
+      .expect({ error: 'booking already cancelled' });
+
+    // Slot is now free for a new confirmed booking
+    const rebooked = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({
+        slot_id: 'cancel-slot',
+        name: 'Bob',
+        email: 'bob-rebook@example.com',
+      })
+      .expect(201);
+
+    expect(rebooked.body.id).not.toBe(created.body.id);
+    expect(rebooked.body.status).toBe('confirmed');
   }, 15_000);
+
+  it('GET /bookings validates email/limit/cursor and pages 25 bookings cleanly with limit=10', async () => {
+    await request(app.getHttpServer())
+      .post('/reset')
+      .set('X-API-Key', apiKey)
+      .send({
+        slots: Array.from({ length: 25 }, (_, i) => ({
+          id: `page-slot-${i}`,
+          provider: 'dr-smith',
+          start: futureStart,
+          end: futureEnd,
+        })),
+      })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .get('/bookings')
+      .set('X-API-Key', apiKey)
+      .expect(400)
+      .expect({ error: 'email is required' });
+
+    await request(app.getHttpServer())
+      .get('/bookings?email=pager@example.com&limit=51')
+      .set('X-API-Key', apiKey)
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get('/bookings?email=pager@example.com&limit=0')
+      .set('X-API-Key', apiKey)
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get('/bookings?email=pager@example.com&cursor=not-valid!')
+      .set('X-API-Key', apiKey)
+      .expect(400);
+
+    // Seed 25 bookings in order (first cancelled, rest confirmed)
+    const ids = Array.from({ length: 25 }, (_, i) => `b-page-${i}`);
+    const slotIds = Array.from({ length: 25 }, (_, i) => `page-slot-${i}`);
+    const names = Array.from({ length: 25 }, (_, i) => `User ${i}`);
+    const emails = Array.from({ length: 25 }, () => 'pager@example.com');
+    const statuses = Array.from({ length: 25 }, (_, i) =>
+      i === 0 ? 'cancelled' : 'confirmed',
+    );
+    await db.query(
+      `INSERT INTO bookings (id, slot_id, name, email, status)
+       SELECT id, slot_id, name, email, status
+       FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
+         AS t(id, slot_id, name, email, status)`,
+      [ids, slotIds, names, emails, statuses],
+    );
+
+    const p1 = await request(app.getHttpServer())
+      .get('/bookings?email=PAGER@Example.COM&limit=10')
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(p1.body.bookings).toHaveLength(10);
+    expect(p1.body.bookings[0].status).toBe('cancelled');
+    expect(p1.body.next_cursor).toEqual(expect.any(String));
+    expect(p1.body.bookings[0].seq).toBeUndefined();
+
+    const p2 = await request(app.getHttpServer())
+      .get(`/bookings?email=pager@example.com&limit=10&cursor=${p1.body.next_cursor}`)
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(p2.body.bookings).toHaveLength(10);
+    expect(p2.body.next_cursor).toEqual(expect.any(String));
+
+    const p3 = await request(app.getHttpServer())
+      .get(`/bookings?email=pager@example.com&limit=10&cursor=${p2.body.next_cursor}`)
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(p3.body.bookings).toHaveLength(5);
+    expect(p3.body.next_cursor).toBeNull();
+
+    const returnedIds = [
+      ...p1.body.bookings,
+      ...p2.body.bookings,
+      ...p3.body.bookings,
+    ].map((b: { id: string }) => b.id);
+    expect(returnedIds).toEqual(ids);
+  }, 20_000);
 
   it('returns {"error": ...} for unknown routes (404) when authenticated', async () => {
     const res = await request(app.getHttpServer())
