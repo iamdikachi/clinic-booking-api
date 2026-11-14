@@ -11,7 +11,7 @@ import {
 } from './../src/config/swagger.config';
 import { DatabaseService } from './../src/database/database.service';
 
-describe('App (e2e) - Setup, Schema, Auth & Swagger', () => {
+describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
   let app: INestApplication<App>;
   let db: DatabaseService;
   let apiKey: string;
@@ -31,6 +31,10 @@ describe('App (e2e) - Setup, Schema, Auth & Swagger', () => {
   });
 
   afterAll(async () => {
+    await db.query('DELETE FROM bookings');
+    await db.query('DELETE FROM slots');
+    await db.query('DELETE FROM idempotency_keys');
+    await db.query('DELETE FROM attempts');
     await app.close();
   });
 
@@ -116,7 +120,18 @@ describe('App (e2e) - Setup, Schema, Auth & Swagger', () => {
       .expect({ error: 'unauthorized' });
 
     await request(app.getHttpServer())
-      .get('/')
+      .get('/slots')
+      .expect(401)
+      .expect({ error: 'unauthorized' });
+
+    await request(app.getHttpServer())
+      .post('/reset')
+      .send({ slots: [] })
+      .expect(401)
+      .expect({ error: 'unauthorized' });
+
+    await request(app.getHttpServer())
+      .get('/bookings/missing')
       .set('X-API-Key', 'wrong-key')
       .expect(401)
       .expect({ error: 'unauthorized' });
@@ -135,29 +150,170 @@ describe('App (e2e) - Setup, Schema, Auth & Swagger', () => {
       .expect('Hello World!');
   });
 
-  it('GET /docs serves Swagger UI HTML', async () => {
-    const res = await request(app.getHttpServer()).get('/docs').expect(200);
-    expect(res.headers['content-type']).toContain('text/html');
-    expect(res.text).toContain('Clinic Booking API Docs');
-    expect(res.text).toContain('id="swagger-ui"');
-  });
+  it('GET /docs and GET /docs-json expose OpenAPI spec with Level 1 routes', async () => {
+    const uiRes = await request(app.getHttpServer()).get('/docs').expect(200);
+    expect(uiRes.headers['content-type']).toContain('text/html');
+    expect(uiRes.text).toContain('Clinic Booking API Docs');
+    expect(uiRes.text).toContain('id="swagger-ui"');
 
-  it('GET /docs-json serves the OpenAPI specification', async () => {
-    const res = await request(app.getHttpServer())
+    const jsonRes = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
 
-    expect(res.body.info).toMatchObject({
+    expect(jsonRes.body.info).toMatchObject({
       title: 'Clinic Booking API',
       version: '1.0',
     });
-    expect(res.body.components.securitySchemes[API_KEY_SECURITY]).toMatchObject({
+    expect(
+      jsonRes.body.components.securitySchemes[API_KEY_SECURITY],
+    ).toMatchObject({
       type: 'apiKey',
       name: 'X-API-Key',
       in: 'header',
     });
-    expect(res.body.components.schemas.ErrorResponseDto).toBeDefined();
-    expect(res.body.paths['/']).toBeDefined();
+    expect(jsonRes.body.components.schemas.ErrorResponseDto).toBeDefined();
+    expect(jsonRes.body.paths['/reset']).toBeDefined();
+    expect(jsonRes.body.paths['/slots']).toBeDefined();
+    expect(jsonRes.body.paths['/bookings/{id}']).toBeDefined();
+  });
+
+  it('POST /reset clears all tables and keeps past slots, and GET /slots orders and filters properly', async () => {
+    await db.query(
+      `INSERT INTO idempotency_keys (key, body_hash, status_code, response)
+       VALUES ('old-key', 'hash', 201, '{}'::jsonb)`,
+    );
+    await db.query(`INSERT INTO attempts (email) VALUES ('old@example.com')`);
+
+    const resetRes = await request(app.getHttpServer())
+      .post('/reset')
+      .set('X-API-Key', apiKey)
+      .send({
+        slots: [
+          {
+            id: 'slot-late',
+            provider: 'dr-smith',
+            start: '2026-12-10T11:00:00Z',
+            end: '2026-12-10T11:30:00Z',
+          },
+          {
+            id: 'slot-past',
+            provider: 'dr-smith',
+            start: '2020-01-01T09:00:00Z',
+            end: '2020-01-01T09:30:00Z',
+          },
+          {
+            id: 'slot-other',
+            provider: 'dr-jones',
+            start: '2026-12-10T09:00:00Z',
+            end: '2026-12-10T09:30:00Z',
+          },
+        ],
+      })
+      .expect(200);
+
+    expect(resetRes.body).toEqual({ ok: true, slots_created: 3 });
+
+    const idempCount = await db.query<{ count: string }>(
+      'SELECT COUNT(*)::text AS count FROM idempotency_keys',
+    );
+    const attemptsCount = await db.query<{ count: string }>(
+      'SELECT COUNT(*)::text AS count FROM attempts',
+    );
+    expect(idempCount.rows[0].count).toBe('0');
+    expect(attemptsCount.rows[0].count).toBe('0');
+
+    // Insert a cancelled booking on slot-past and a confirmed booking on slot-late
+    await db.query(
+      `INSERT INTO bookings (id, slot_id, name, email, status)
+       VALUES ('b-cancelled', 'slot-past', 'Past User', 'past@example.com', 'cancelled'),
+              ('b-confirmed', 'slot-late', 'Alice', 'alice@example.com', 'confirmed')`,
+    );
+
+    const allSlotsRes = await request(app.getHttpServer())
+      .get('/slots')
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(allSlotsRes.body).toEqual({
+      slots: [
+        {
+          id: 'slot-past',
+          provider: 'dr-smith',
+          start: '2020-01-01T09:00:00Z',
+          end: '2020-01-01T09:30:00Z',
+          available: true,
+        },
+        {
+          id: 'slot-other',
+          provider: 'dr-jones',
+          start: '2026-12-10T09:00:00Z',
+          end: '2026-12-10T09:30:00Z',
+          available: true,
+        },
+        {
+          id: 'slot-late',
+          provider: 'dr-smith',
+          start: '2026-12-10T11:00:00Z',
+          end: '2026-12-10T11:30:00Z',
+          available: false,
+        },
+      ],
+    });
+
+    const filteredRes = await request(app.getHttpServer())
+      .get('/slots?provider=dr-smith')
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(filteredRes.body.slots).toHaveLength(2);
+    expect(filteredRes.body.slots.map((s: { id: string }) => s.id)).toEqual([
+      'slot-past',
+      'slot-late',
+    ]);
+  });
+
+  it('GET /bookings/:id returns 200 without seq or 404 when missing', async () => {
+    await request(app.getHttpServer())
+      .post('/reset')
+      .set('X-API-Key', apiKey)
+      .send({
+        slots: [
+          {
+            id: 'slot-1',
+            provider: 'dr-smith',
+            start: '2026-12-10T09:00:00Z',
+            end: '2026-12-10T09:30:00Z',
+          },
+        ],
+      })
+      .expect(200);
+
+    await db.query(
+      `INSERT INTO bookings (id, slot_id, name, email, status)
+       VALUES ('booking-1', 'slot-1', 'Alice', 'alice@example.com', 'confirmed')`,
+    );
+
+    const found = await request(app.getHttpServer())
+      .get('/bookings/booking-1')
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(found.body).toEqual({
+      id: 'booking-1',
+      slot_id: 'slot-1',
+      name: 'Alice',
+      email: 'alice@example.com',
+      status: 'confirmed',
+      created_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/),
+    });
+    expect(found.body.seq).toBeUndefined();
+
+    const notFound = await request(app.getHttpServer())
+      .get('/bookings/does-not-exist')
+      .set('X-API-Key', apiKey)
+      .expect(404);
+
+    expect(notFound.body).toEqual({ error: 'booking not found' });
   });
 
   it('returns {"error": ...} for unknown routes (404) when authenticated', async () => {
@@ -174,7 +330,7 @@ describe('App (e2e) - Setup, Schema, Auth & Swagger', () => {
 
   it('returns {"error": ...} for malformed JSON bodies (400) when authenticated', async () => {
     const res = await request(app.getHttpServer())
-      .post('/does-not-exist')
+      .post('/reset')
       .set('X-API-Key', apiKey)
       .set('Content-Type', 'application/json')
       .send('{"broken": ')
