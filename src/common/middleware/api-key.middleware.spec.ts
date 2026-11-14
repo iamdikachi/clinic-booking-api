@@ -18,8 +18,19 @@ describe('ApiKeyMiddleware', () => {
     next = jest.fn();
   });
 
+  it('calls next() for OPTIONS preflight requests without X-API-Key', () => {
+    const req = {
+      method: 'OPTIONS',
+      headers: {},
+    } as unknown as Request;
+
+    middleware.use(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
   it('calls next() when X-API-Key matches API_KEY', () => {
     const req = {
+      method: 'GET',
       headers: { 'x-api-key': 'expected-secret-key' },
     } as unknown as Request;
 

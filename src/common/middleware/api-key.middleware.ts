@@ -29,6 +29,12 @@ export class ApiKeyMiddleware implements NestMiddleware {
   }
 
   use(req: Request, _res: Response, next: NextFunction): void {
+    // Allow browser CORS preflight requests without requiring an API key.
+    if (req.method?.toUpperCase() === 'OPTIONS') {
+      next();
+      return;
+    }
+
     const provided = req.headers['x-api-key'];
     if (
       typeof provided !== 'string' ||

@@ -4,6 +4,7 @@ import { Test, type TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
+import { setupCors } from './../src/config/cors.config';
 import type { EnvConfig } from './../src/config/env.validation';
 import {
   API_KEY_SECURITY,
@@ -25,6 +26,7 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
     }).compile();
 
     app = moduleFixture.createNestApplication();
+    setupCors(app);
     setupSwagger(app);
     await app.init();
     db = app.get(DatabaseService);
@@ -885,5 +887,42 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () 
       error: expect.any(String),
     });
     expect(Object.keys(res.body)).toEqual(['error']);
+  });
+
+  it('handles CORS preflight OPTIONS without X-API-Key and allows X-API-Key and Idempotency-Key', async () => {
+    const preflight = await request(app.getHttpServer())
+      .options('/bookings')
+      .set('Origin', 'http://localhost:5500')
+      .set('Access-Control-Request-Method', 'POST')
+      .set(
+        'Access-Control-Request-Headers',
+        'X-API-Key, Idempotency-Key, Content-Type',
+      )
+      .expect(204);
+
+    expect(preflight.headers['access-control-allow-origin']).toBe('*');
+    const allowHeaders = String(
+      preflight.headers['access-control-allow-headers'] ?? '',
+    ).toLowerCase();
+    expect(allowHeaders).toContain('x-api-key');
+    expect(allowHeaders).toContain('idempotency-key');
+    expect(allowHeaders).toContain('content-type');
+
+    // Non-preflight OPTIONS also bypasses X-API-Key middleware rather than 401
+    const plainOptions = await request(app.getHttpServer())
+      .options('/bookings')
+      .set('Origin', 'http://localhost:5500');
+    expect(plainOptions.status).not.toBe(401);
+
+    const actual = await request(app.getHttpServer())
+      .get('/slots')
+      .set('Origin', 'http://localhost:5500')
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(actual.headers['access-control-allow-origin']).toBe('*');
+    expect(
+      String(actual.headers['access-control-expose-headers'] ?? '').toLowerCase(),
+    ).toContain('retry-after');
   });
 });
