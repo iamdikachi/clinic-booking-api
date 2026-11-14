@@ -1,17 +1,35 @@
-import { Controller, Get, Param } from '@nestjs/common';
 import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  HttpException,
+  Param,
+  Post,
+  Res,
+} from '@nestjs/common';
+import {
+  ApiBadRequestResponse,
+  ApiBody,
+  ApiConflictResponse,
+  ApiCreatedResponse,
+  ApiHeader,
   ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
   ApiParam,
   ApiSecurity,
   ApiTags,
+  ApiTooManyRequestsResponse,
   ApiUnauthorizedResponse,
+  ApiUnprocessableEntityResponse,
 } from '@nestjs/swagger';
+import type { Response } from 'express';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
 import { API_KEY_SECURITY } from '../config/swagger.config';
 import { BookingsService } from './bookings.service';
 import { BookingDto } from './dto/booking.dto';
+import { CreateBookingDto } from './dto/create-booking.dto';
 
 @ApiTags('Bookings')
 @ApiSecurity(API_KEY_SECURITY)
@@ -22,6 +40,52 @@ import { BookingDto } from './dto/booking.dto';
 @Controller('bookings')
 export class BookingsController {
   constructor(private readonly bookingsService: BookingsService) {}
+
+  @Post()
+  @ApiOperation({
+    summary: 'Create a booking for an available future slot',
+    description:
+      'Enforces per-email rate limiting (5 attempts / 60s), validates inputs, supports Idempotency-Key replays, and atomically books the slot.',
+  })
+  @ApiHeader({
+    name: 'Idempotency-Key',
+    required: false,
+    description: 'Optional idempotency key for safe request retries',
+  })
+  @ApiBody({ type: CreateBookingDto })
+  @ApiCreatedResponse({ type: BookingDto, description: 'Booking confirmed' })
+  @ApiBadRequestResponse({
+    description: 'Invalid payload or slot start time is in the past',
+    type: ErrorResponseDto,
+  })
+  @ApiNotFoundResponse({
+    description: 'Slot not found',
+    type: ErrorResponseDto,
+  })
+  @ApiConflictResponse({
+    description: 'Slot already has a confirmed booking',
+    type: ErrorResponseDto,
+  })
+  @ApiUnprocessableEntityResponse({
+    description: 'Idempotency-Key reused with a different request body',
+    type: ErrorResponseDto,
+  })
+  @ApiTooManyRequestsResponse({
+    description: 'Rate limit exceeded (includes Retry-After header)',
+    type: ErrorResponseDto,
+  })
+  async create(
+    @Body() body: unknown,
+    @Headers('idempotency-key') idempotencyKey: string | string[] | undefined,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<BookingDto> {
+    const outcome = await this.bookingsService.create(body, idempotencyKey);
+    if (outcome.statusCode >= 400) {
+      throw new HttpException(outcome.body, outcome.statusCode);
+    }
+    res.status(outcome.statusCode);
+    return outcome.body as BookingDto;
+  }
 
   @Get(':id')
   @ApiOperation({ summary: 'Get a single booking by ID' })

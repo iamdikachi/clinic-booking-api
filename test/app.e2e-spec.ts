@@ -11,10 +11,13 @@ import {
 } from './../src/config/swagger.config';
 import { DatabaseService } from './../src/database/database.service';
 
-describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
+describe('App (e2e) - Setup, Schema, Auth, Swagger, Level 1 & Core Booking', () => {
   let app: INestApplication<App>;
   let db: DatabaseService;
   let apiKey: string;
+
+  const futureStart = '2030-12-10T09:00:00Z';
+  const futureEnd = '2030-12-10T09:30:00Z';
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -131,6 +134,12 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
       .expect({ error: 'unauthorized' });
 
     await request(app.getHttpServer())
+      .post('/bookings')
+      .send({ slot_id: 'slot-1', name: 'Alice', email: 'alice@example.com' })
+      .expect(401)
+      .expect({ error: 'unauthorized' });
+
+    await request(app.getHttpServer())
       .get('/bookings/missing')
       .set('X-API-Key', 'wrong-key')
       .expect(401)
@@ -150,7 +159,7 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
       .expect('Hello World!');
   });
 
-  it('GET /docs and GET /docs-json expose OpenAPI spec with Level 1 routes', async () => {
+  it('GET /docs and GET /docs-json expose OpenAPI spec with all routes', async () => {
     const uiRes = await request(app.getHttpServer()).get('/docs').expect(200);
     expect(uiRes.headers['content-type']).toContain('text/html');
     expect(uiRes.text).toContain('Clinic Booking API Docs');
@@ -172,8 +181,10 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
       in: 'header',
     });
     expect(jsonRes.body.components.schemas.ErrorResponseDto).toBeDefined();
+    expect(jsonRes.body.components.schemas.CreateBookingDto).toBeDefined();
     expect(jsonRes.body.paths['/reset']).toBeDefined();
     expect(jsonRes.body.paths['/slots']).toBeDefined();
+    expect(jsonRes.body.paths['/bookings'].post).toBeDefined();
     expect(jsonRes.body.paths['/bookings/{id}']).toBeDefined();
   });
 
@@ -222,7 +233,6 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
     expect(idempCount.rows[0].count).toBe('0');
     expect(attemptsCount.rows[0].count).toBe('0');
 
-    // Insert a cancelled booking on slot-past and a confirmed booking on slot-late
     await db.query(
       `INSERT INTO bookings (id, slot_id, name, email, status)
        VALUES ('b-cancelled', 'slot-past', 'Past User', 'past@example.com', 'cancelled'),
@@ -270,7 +280,7 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
       'slot-past',
       'slot-late',
     ]);
-  });
+  }, 15_000);
 
   it('GET /bookings/:id returns 200 without seq or 404 when missing', async () => {
     await request(app.getHttpServer())
@@ -281,31 +291,40 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
           {
             id: 'slot-1',
             provider: 'dr-smith',
-            start: '2026-12-10T09:00:00Z',
-            end: '2026-12-10T09:30:00Z',
+            start: futureStart,
+            end: futureEnd,
           },
         ],
       })
       .expect(200);
 
-    await db.query(
-      `INSERT INTO bookings (id, slot_id, name, email, status)
-       VALUES ('booking-1', 'slot-1', 'Alice', 'alice@example.com', 'confirmed')`,
-    );
-
-    const found = await request(app.getHttpServer())
-      .get('/bookings/booking-1')
+    const created = await request(app.getHttpServer())
+      .post('/bookings')
       .set('X-API-Key', apiKey)
-      .expect(200);
+      .send({
+        slot_id: 'slot-1',
+        name: '  Alice  ',
+        email: '  ALICE@Example.COM ',
+      })
+      .expect(201);
 
-    expect(found.body).toEqual({
-      id: 'booking-1',
+    expect(created.body).toEqual({
+      id: expect.any(String),
       slot_id: 'slot-1',
       name: 'Alice',
       email: 'alice@example.com',
       status: 'confirmed',
-      created_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/),
+      created_at: expect.stringMatching(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/,
+      ),
     });
+
+    const found = await request(app.getHttpServer())
+      .get(`/bookings/${created.body.id}`)
+      .set('X-API-Key', apiKey)
+      .expect(200);
+
+    expect(found.body).toEqual(created.body);
     expect(found.body.seq).toBeUndefined();
 
     const notFound = await request(app.getHttpServer())
@@ -314,7 +333,241 @@ describe('App (e2e) - Setup, Schema, Auth, Swagger & Level 1', () => {
       .expect(404);
 
     expect(notFound.body).toEqual({ error: 'booking not found' });
-  });
+  }, 15_000);
+
+  it('POST /bookings validates inputs (400) and slot availability/time (404 / 400)', async () => {
+    await request(app.getHttpServer())
+      .post('/reset')
+      .set('X-API-Key', apiKey)
+      .send({
+        slots: [
+          {
+            id: 'slot-past',
+            provider: 'dr-smith',
+            start: '2020-01-01T09:00:00Z',
+            end: '2020-01-01T09:30:00Z',
+          },
+        ],
+      })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: '   ', name: 'Alice', email: 'val@example.com' })
+      .expect(400)
+      .expect({ error: 'slot_id is required' });
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 'slot-past', name: '  ', email: 'val@example.com' })
+      .expect(400)
+      .expect({ error: 'name is required' });
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 'slot-past', name: 'Alice', email: 'bad-email' })
+      .expect(400)
+      .expect({ error: 'email must be a valid email address' });
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 'no-such-slot', name: 'Alice', email: 'a@example.com' })
+      .expect(404)
+      .expect({ error: 'slot not found' });
+
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({ slot_id: 'slot-past', name: 'Alice', email: 'b@example.com' })
+      .expect(400)
+      .expect({ error: 'slot is in the past' });
+  }, 15_000);
+
+  it('POST /bookings allows exactly 1 winner out of 20 parallel requests (1x 201, 19x 409)', async () => {
+    await request(app.getHttpServer())
+      .post('/reset')
+      .set('X-API-Key', apiKey)
+      .send({
+        slots: [
+          {
+            id: 'race-slot',
+            provider: 'dr-smith',
+            start: futureStart,
+            end: futureEnd,
+          },
+        ],
+      })
+      .expect(200);
+
+    const responses = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        request(app.getHttpServer())
+          .post('/bookings')
+          .set('X-API-Key', apiKey)
+          .send({
+            slot_id: 'race-slot',
+            name: `User ${i}`,
+            email: `user${i}@example.com`,
+          }),
+      ),
+    );
+
+    const created = responses.filter((r) => r.status === 201);
+    const conflicts = responses.filter((r) => r.status === 409);
+
+    expect(created).toHaveLength(1);
+    expect(conflicts).toHaveLength(19);
+    for (const conflict of conflicts) {
+      expect(conflict.body).toEqual({ error: 'slot already booked' });
+    }
+  }, 20_000);
+
+  it('POST /bookings supports Idempotency-Key replay (including 4xx and parallel retries) and 422 on body mismatch', async () => {
+    await request(app.getHttpServer())
+      .post('/reset')
+      .set('X-API-Key', apiKey)
+      .send({
+        slots: [
+          {
+            id: 'idem-slot',
+            provider: 'dr-smith',
+            start: futureStart,
+            end: futureEnd,
+          },
+        ],
+      })
+      .expect(200);
+
+    const [r1, r2] = await Promise.all([
+      request(app.getHttpServer())
+        .post('/bookings')
+        .set('X-API-Key', apiKey)
+        .set('Idempotency-Key', 'key-success')
+        .send({
+          slot_id: 'idem-slot',
+          name: 'Alice',
+          email: 'alice-idem@example.com',
+        }),
+      request(app.getHttpServer())
+        .post('/bookings')
+        .set('X-API-Key', apiKey)
+        .set('Idempotency-Key', 'key-success')
+        .send({
+          email: 'alice-idem@example.com',
+          name: 'Alice',
+          slot_id: 'idem-slot',
+        }),
+    ]);
+
+    expect(r1.status).toBe(201);
+    expect(r2.status).toBe(201);
+    expect(r2.body).toEqual(r1.body);
+
+    // Mismatched body with same key -> 422
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'key-success')
+      .send({
+        slot_id: 'idem-slot',
+        name: 'Different Name',
+        email: 'alice-idem@example.com',
+      })
+      .expect(422)
+      .expect({ error: 'idempotency key reused with different request body' });
+
+    // Replays 409 identically even if slot were checked again
+    const err1 = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'key-409')
+      .send({
+        slot_id: 'idem-slot',
+        name: 'Bob',
+        email: 'bob-idem@example.com',
+      })
+      .expect(409);
+
+    const err2 = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'key-409')
+      .send({
+        slot_id: 'idem-slot',
+        name: 'Bob',
+        email: 'bob-idem@example.com',
+      })
+      .expect(409);
+
+    expect(err2.body).toEqual(err1.body);
+  }, 15_000);
+
+  it('POST /bookings enforces per-email rate limit (5/60s), counts failures & retries, sets Retry-After, and isolates other emails', async () => {
+    await request(app.getHttpServer())
+      .post('/reset')
+      .set('X-API-Key', apiKey)
+      .send({
+        slots: [
+          {
+            id: 'rl-slot',
+            provider: 'dr-smith',
+            start: futureStart,
+            end: futureEnd,
+          },
+        ],
+      })
+      .expect(200);
+
+    // 5 parallel attempts for same email (1x 201 + 4x 409, none 429)
+    const burst = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        request(app.getHttpServer())
+          .post('/bookings')
+          .set('X-API-Key', apiKey)
+          .set('Idempotency-Key', 'rl-same-key')
+          .send({
+            slot_id: 'rl-slot',
+            name: 'Same User',
+            email: '  RATE@Example.COM ',
+          }),
+      ),
+    );
+
+    expect(burst.every((r) => r.status === 201)).toBe(true);
+
+    // 6th attempt (even a replay with same Idempotency-Key) hits 429 with Retry-After >= 1
+    const sixth = await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .set('Idempotency-Key', 'rl-same-key')
+      .send({
+        slot_id: 'rl-slot',
+        name: 'Same User',
+        email: 'rate@example.com',
+      })
+      .expect(429);
+
+    expect(sixth.body).toEqual({ error: 'rate limit exceeded' });
+    const retryAfter = Number(sixth.headers['retry-after']);
+    expect(Number.isInteger(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+
+    // Different email is unaffected (gets 409 for already booked slot, not 429)
+    await request(app.getHttpServer())
+      .post('/bookings')
+      .set('X-API-Key', apiKey)
+      .send({
+        slot_id: 'rl-slot',
+        name: 'Other User',
+        email: 'other@example.com',
+      })
+      .expect(409);
+  }, 15_000);
 
   it('returns {"error": ...} for unknown routes (404) when authenticated', async () => {
     const res = await request(app.getHttpServer())

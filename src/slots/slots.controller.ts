@@ -30,6 +30,7 @@ export class SlotsController {
   @ApiQuery({
     name: 'provider',
     required: false,
+    type: String,
     description: 'Filter slots by provider identifier',
   })
   @ApiOkResponse({ type: SlotsListResponseDto })
