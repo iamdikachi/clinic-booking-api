@@ -1,8 +1,21 @@
 import { Controller, Get } from '@nestjs/common';
-import { ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
+import {
+  ApiOkResponse,
+  ApiOperation,
+  ApiSecurity,
+  ApiTags,
+  ApiUnauthorizedResponse,
+} from '@nestjs/swagger';
 import { AppService } from './app.service';
+import { ErrorResponseDto } from './common/dto/error-response.dto';
+import { API_KEY_SECURITY } from './config/swagger.config';
 
 @ApiTags('General')
+@ApiSecurity(API_KEY_SECURITY)
+@ApiUnauthorizedResponse({
+  description: 'Missing or invalid X-API-Key header',
+  type: ErrorResponseDto,
+})
 @Controller()
 export class AppController {
   constructor(private readonly appService: AppService) {}

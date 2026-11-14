@@ -1,17 +1,20 @@
 import { type INestApplication } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Test, type TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
+import type { EnvConfig } from './../src/config/env.validation';
 import {
   API_KEY_SECURITY,
   setupSwagger,
 } from './../src/config/swagger.config';
 import { DatabaseService } from './../src/database/database.service';
 
-describe('App (e2e) - Step 1 Setup & Swagger', () => {
+describe('App (e2e) - Setup, Schema, Auth & Swagger', () => {
   let app: INestApplication<App>;
   let db: DatabaseService;
+  let apiKey: string;
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -22,6 +25,9 @@ describe('App (e2e) - Step 1 Setup & Swagger', () => {
     setupSwagger(app);
     await app.init();
     db = app.get(DatabaseService);
+    apiKey = app.get(ConfigService<EnvConfig, true>).get('API_KEY', {
+      infer: true,
+    });
   });
 
   afterAll(async () => {
@@ -103,9 +109,28 @@ describe('App (e2e) - Step 1 Setup & Swagger', () => {
     }
   });
 
-  it('GET / returns 200', async () => {
+  it('returns 401 {"error":"unauthorized"} when X-API-Key is missing or wrong', async () => {
     await request(app.getHttpServer())
       .get('/')
+      .expect(401)
+      .expect({ error: 'unauthorized' });
+
+    await request(app.getHttpServer())
+      .get('/')
+      .set('X-API-Key', 'wrong-key')
+      .expect(401)
+      .expect({ error: 'unauthorized' });
+
+    await request(app.getHttpServer())
+      .get('/does-not-exist')
+      .expect(401)
+      .expect({ error: 'unauthorized' });
+  });
+
+  it('GET / returns 200 with valid X-API-Key', async () => {
+    await request(app.getHttpServer())
+      .get('/')
+      .set('X-API-Key', apiKey)
       .expect(200)
       .expect('Hello World!');
   });
@@ -135,9 +160,10 @@ describe('App (e2e) - Step 1 Setup & Swagger', () => {
     expect(res.body.paths['/']).toBeDefined();
   });
 
-  it('returns {"error": ...} for unknown routes (404)', async () => {
+  it('returns {"error": ...} for unknown routes (404) when authenticated', async () => {
     const res = await request(app.getHttpServer())
       .get('/does-not-exist')
+      .set('X-API-Key', apiKey)
       .expect(404);
 
     expect(res.body).toEqual({
@@ -146,9 +172,10 @@ describe('App (e2e) - Step 1 Setup & Swagger', () => {
     expect(Object.keys(res.body)).toEqual(['error']);
   });
 
-  it('returns {"error": ...} for malformed JSON bodies (400)', async () => {
+  it('returns {"error": ...} for malformed JSON bodies (400) when authenticated', async () => {
     const res = await request(app.getHttpServer())
       .post('/does-not-exist')
+      .set('X-API-Key', apiKey)
       .set('Content-Type', 'application/json')
       .send('{"broken": ')
       .expect(400);
