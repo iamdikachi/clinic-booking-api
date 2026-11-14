@@ -32,6 +32,77 @@ describe('App (e2e) - Step 1 Setup & Swagger', () => {
     await expect(db.ping()).resolves.toBe(true);
   });
 
+  it('ensures Step 2 tables and indexes exist', async () => {
+    const tablesRes = await db.query<{ table_name: string }>(
+      `SELECT table_name
+       FROM information_schema.tables
+       WHERE table_schema = 'public'
+       ORDER BY table_name`,
+    );
+    expect(tablesRes.rows.map((r) => r.table_name)).toEqual(
+      expect.arrayContaining([
+        'attempts',
+        'bookings',
+        'idempotency_keys',
+        'slots',
+      ]),
+    );
+
+    const indexesRes = await db.query<{ indexname: string }>(
+      `SELECT indexname
+       FROM pg_indexes
+       WHERE schemaname = 'public'`,
+    );
+    expect(indexesRes.rows.map((r) => r.indexname)).toEqual(
+      expect.arrayContaining([
+        'one_confirmed_per_slot',
+        'bookings_email_seq',
+        'attempts_email_at',
+      ]),
+    );
+  });
+
+  it('enforces one_confirmed_per_slot partial unique index', async () => {
+    const slotId = 'e2e-step2-slot';
+    await db.query('DELETE FROM slots WHERE id = $1', [slotId]);
+
+    try {
+      await db.query(
+        `INSERT INTO slots (id, provider, start_time, end_time)
+         VALUES ($1, $2, now() + interval '1 hour', now() + interval '2 hour')`,
+        [slotId, 'dr-step2'],
+      );
+
+      await db.query(
+        `INSERT INTO bookings (id, slot_id, name, email, status)
+         VALUES ($1, $2, $3, $4, 'confirmed')`,
+        ['b-step2-1', slotId, 'Alice', 'alice@example.com'],
+      );
+
+      await expect(
+        db.query(
+          `INSERT INTO bookings (id, slot_id, name, email, status)
+           VALUES ($1, $2, $3, $4, 'confirmed')`,
+          ['b-step2-2', slotId, 'Bob', 'bob@example.com'],
+        ),
+      ).rejects.toMatchObject({ code: '23505' });
+
+      await db.query(`UPDATE bookings SET status = 'cancelled' WHERE id = $1`, [
+        'b-step2-1',
+      ]);
+
+      await expect(
+        db.query(
+          `INSERT INTO bookings (id, slot_id, name, email, status)
+           VALUES ($1, $2, $3, $4, 'confirmed')`,
+          ['b-step2-3', slotId, 'Bob', 'bob@example.com'],
+        ),
+      ).resolves.toBeDefined();
+    } finally {
+      await db.query('DELETE FROM slots WHERE id = $1', [slotId]);
+    }
+  });
+
   it('GET / returns 200', async () => {
     await request(app.getHttpServer())
       .get('/')

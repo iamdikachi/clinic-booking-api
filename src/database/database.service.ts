@@ -12,6 +12,7 @@ import {
   type QueryResultRow,
 } from 'pg';
 import type { EnvConfig } from '../config/env.validation';
+import { SCHEMA_SQL } from './schema';
 
 /**
  * Upgrades `sslmode=require` to `sslmode=verify-full` (when libpq compat is not
@@ -56,7 +57,20 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit(): Promise<void> {
     await this.pool.query('SELECT 1');
-    this.logger.log('Connected to Postgres');
+    await this.ensureSchema();
+    this.logger.log('Connected to Postgres and verified schema');
+  }
+
+  /**
+   * Ensures tables and indexes exist using an advisory lock to avoid concurrent DDL races.
+   */
+  async ensureSchema(): Promise<void> {
+    await this.withTransaction(async (client) => {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext('clinic_api_schema_init'))",
+      );
+      await client.query(SCHEMA_SQL);
+    });
   }
 
   async onModuleDestroy(): Promise<void> {
